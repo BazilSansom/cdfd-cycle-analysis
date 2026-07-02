@@ -1,0 +1,20 @@
+# MATLAB
+*.asv
+*.m~
+*.autosave
+slprj/
+codegen/
+*.mex*
+
+# Local data / temporary files
+*.mat
+tmp/
+temp/
+output/
+outputs/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+archive_local/
