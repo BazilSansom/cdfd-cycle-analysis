@@ -457,6 +457,97 @@ function results = runBasicValidation(varargin)
         end
     end
 
+    %% 11. Cycle Monte Carlo estimator
+
+    testName = "Cycle Monte Carlo estimator";
+
+    try
+        % Deterministic directed triangle: Monte Carlo should be exact.
+        Wcycle = zeros(3);
+        Wcycle(1,2) = 1;
+        Wcycle(2,3) = 1;
+        Wcycle(3,1) = 1;
+
+        Rcycle = cdfdCycleAnalysis(Wcycle, 'Tol', tol);
+
+        MCcycle = cdfdCycleMonteCarlo(Rcycle.C, ...
+            'NumSamples', 1000, ...
+            'Seed', 1, ...
+            'Verbose', false, ...
+            'Tol', tol);
+
+        assertClose(MCcycle.Estimates.T_C, 1, tol, ...
+            'Monte Carlo directed triangle T_C');
+
+        assertClose(MCcycle.Estimates.Lbar_C, 3, tol, ...
+            'Monte Carlo directed triangle Lbar_C');
+
+        assert(height(MCcycle.CycleTable) == 1, ...
+            'Directed triangle Monte Carlo should observe one cycle.');
+
+        assertClose(MCcycle.CycleTable.lambda(1), 1, tol, ...
+            'Directed triangle Monte Carlo lambda');
+
+        % Self-loop: Monte Carlo should also be exact.
+        Wself = 5;
+
+        Rself = cdfdCycleAnalysis(Wself, 'Tol', tol);
+
+        MCself = cdfdCycleMonteCarlo(Rself.C, ...
+            'NumSamples', 1000, ...
+            'Seed', 1, ...
+            'Verbose', false, ...
+            'Tol', tol);
+
+        assertClose(MCself.Estimates.T_C, 5, tol, ...
+            'Monte Carlo self-loop T_C');
+
+        assertClose(MCself.Estimates.Lbar_C, 1, tol, ...
+            'Monte Carlo self-loop Lbar_C');
+
+        assert(height(MCself.CycleTable) == 1, ...
+            'Self-loop Monte Carlo should observe one cycle.');
+
+        assertClose(MCself.CycleTable.lambda(1), 5, tol, ...
+            'Self-loop Monte Carlo lambda');
+
+        % Bidirected triangle: stochastic but should be close.
+        Wtri = zeros(3);
+        Wtri(1,2) = 1; Wtri(2,1) = 1;
+        Wtri(2,3) = 1; Wtri(3,2) = 1;
+        Wtri(1,3) = 1; Wtri(3,1) = 1;
+
+        Rtri = cdfdCycleAnalysis(Wtri, 'Tol', tol);
+
+        MCtri = cdfdCycleMonteCarlo(Rtri.C, ...
+            'NumSamples', 50000, ...
+            'Seed', 1, ...
+            'Verbose', false, ...
+            'Tol', tol);
+
+        assert(abs(MCtri.Estimates.T_C - Rtri.summary.T_C) < 0.03, ...
+            'Bidirected triangle Monte Carlo T_C is not close to exact value.');
+
+        assert(abs(MCtri.Estimates.Lbar_C - Rtri.summary.Lbar_C) < 0.03, ...
+            'Bidirected triangle Monte Carlo Lbar_C is not close to exact value.');
+
+        assert(abs(MCtri.Estimates.VolumeFromCycles - Rtri.summary.V_C) < 1e-10, ...
+            'Monte Carlo cycle-volume identity failed.');
+
+        assert(height(MCtri.CycleTable) == 5, ...
+            'Bidirected triangle Monte Carlo should observe all five cycles with this sample size.');
+
+        results.MonteCarloTriangle = MCtri;
+
+        [testNames, testPassed, testError] = recordPass(testNames, testPassed, testError, testName);
+
+    catch ME
+        [testNames, testPassed, testError] = recordFail(testNames, testPassed, testError, testName, ME);
+        if opts.StopOnFailure
+            rethrow(ME);
+        end
+    end
+
     %% Finish
 
     results.Tests = table(testNames, testPassed, testError, ...
