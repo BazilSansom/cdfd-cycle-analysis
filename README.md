@@ -46,6 +46,33 @@ R = cdfdCycleAnalysis(W);
 - `makeCdfdExampleFigures.m`  
   Generates reproducible example figures used for validation and illustration.
 
+  - `cdfdSignedCycleSummaries.m`  
+  Computes positive and negative feedback-loop throughput and volume from signed edge labels.
+
+- `cdfdCoParticipationKernel.m`  
+  Computes the edge co-participation kernel \(K_{ef}\), showing which edges appear together in the same cycles.
+
+- `cdfdTopCycles.m`  
+  Returns a ranked table of cycles by throughput contribution, volume contribution, or length.
+
+- `cdfdPlotCycleCoverage.m`  
+  Plots cumulative top-\(k\) coverage curves for circular throughput and circular edge-volume.
+
+- `tests/runBasicValidation.m`  
+  Runs deterministic validation tests for the main toolbox functions.
+
+
+## Validation
+
+Run the basic validation suite from the repository root:
+
+```matlab
+addpath("tests")
+results = runBasicValidation;
+```
+
+All tests should pass.
+
 ## Example figures
 
 To regenerate the example figures:
@@ -60,6 +87,14 @@ This creates:
 figures/fig_bidirected_triangle.pdf
 figures/fig_subdivision_invariance.pdf
 figures/fig_signed_overlap.pdf
+```
+
+To plot top-cycle coverage:
+
+```matlab
+R = cdfdCycleAnalysis(W);
+out = cdfdPlotCycleCoverage(R.Tcycles, ...
+    'RankBy', 'throughput');
 ```
 
 ## Requirements
