@@ -333,7 +333,7 @@ function results = runBasicValidation(varargin)
         end
     end
 
-    
+
     %% 9. Top cycle ranking
 
     testName = "Top cycle ranking";
@@ -380,6 +380,73 @@ function results = runBasicValidation(varargin)
 
         results.TopCyclesThroughput = TopThr;
         results.TopCyclesVolume = TopVol;
+
+        [testNames, testPassed, testError] = recordPass(testNames, testPassed, testError, testName);
+
+    catch ME
+        [testNames, testPassed, testError] = recordFail(testNames, testPassed, testError, testName, ME);
+        if opts.StopOnFailure
+            rethrow(ME);
+        end
+    end
+
+    %% 10. Loop-erased cycle sampler
+
+    testName = "Loop-erased cycle sampler";
+
+    try
+        % Directed triangle: deterministic 3-cycle.
+        Wcycle = zeros(3);
+        Wcycle(1,2) = 1;
+        Wcycle(2,3) = 1;
+        Wcycle(3,1) = 1;
+
+        sCycle = cdfdLoopErasedCycleSample(Wcycle, ...
+            'InputType', 'flow', ...
+            'StartNode', 1, ...
+            'Tol', tol);
+
+        assert(isequal(sCycle.CanonicalCycle, [1 2 3]), ...
+            'Directed triangle sampler should return canonical cycle [1 2 3].');
+
+        assert(sCycle.Length == 3, ...
+            'Directed triangle sampled cycle should have length 3.');
+
+        % Self-loop.
+        Cself = 5;
+
+        sSelf = cdfdLoopErasedCycleSample(Cself, ...
+            'InputType', 'flow', ...
+            'StartNode', 1, ...
+            'Tol', tol);
+
+        assert(isequal(sSelf.Cycle, 1), ...
+            'Self-loop sampler should return cycle [1].');
+
+        assert(sSelf.IsSelfLoop, ...
+            'Self-loop sampler should mark IsSelfLoop as true.');
+
+        % Bidirected triangle: sampled cycle should be one of the five known cycles.
+        Wtri = zeros(3);
+        Wtri(1,2) = 1; Wtri(2,1) = 1;
+        Wtri(2,3) = 1; Wtri(3,2) = 1;
+        Wtri(1,3) = 1; Wtri(3,1) = 1;
+
+        rng(1);
+
+        sTri = cdfdLoopErasedCycleSample(Wtri, ...
+            'InputType', 'flow', ...
+            'Tol', tol);
+
+        validKeys = ["1_2", "1_3", "2_3", "1_2_3", "1_3_2"];
+
+        assert(any(sTri.Key == validKeys), ...
+            'Bidirected triangle sampled cycle key is not one of the expected cycles.');
+
+        assert(sTri.Length == 2 || sTri.Length == 3, ...
+            'Bidirected triangle sampled cycle should have length 2 or 3.');
+
+        results.LoopErasedSample = sTri;
 
         [testNames, testPassed, testError] = recordPass(testNames, testPassed, testError, testName);
 
