@@ -333,6 +333,63 @@ function results = runBasicValidation(varargin)
         end
     end
 
+    
+    %% 9. Top cycle ranking
+
+    testName = "Top cycle ranking";
+
+    try
+        Wtri = zeros(3);
+        Wtri(1,2) = 1; Wtri(2,1) = 1;
+        Wtri(2,3) = 1; Wtri(3,2) = 1;
+        Wtri(1,3) = 1; Wtri(3,1) = 1;
+
+        Rtri = cdfdCycleAnalysis(Wtri, 'Tol', tol);
+
+        TopThr = cdfdTopCycles(Rtri.Tcycles, ...
+            'RankBy', 'throughput', ...
+            'Tol', tol);
+
+        TopVol = cdfdTopCycles(Rtri.Tcycles, ...
+            'RankBy', 'volume', ...
+            'Tol', tol);
+
+        assert(height(TopThr) == 5, 'TopThr should contain five cycles.');
+        assert(height(TopVol) == 5, 'TopVol should contain five cycles.');
+
+        assertClose(TopThr.CumulativeThroughputShare(end), 1, tol, ...
+            'TopThr cumulative throughput coverage');
+
+        assertClose(TopThr.CumulativeVolumeShare(end), 1, tol, ...
+            'TopThr cumulative volume coverage');
+
+        assertClose(TopVol.CumulativeThroughputShare(end), 1, tol, ...
+            'TopVol cumulative throughput coverage');
+
+        assertClose(TopVol.CumulativeVolumeShare(end), 1, tol, ...
+            'TopVol cumulative volume coverage');
+
+        assert(all(TopThr.Length(1:3) == 2), ...
+            'Top throughput cycles should begin with the three 2-cycles.');
+
+        assert(all(abs(TopThr.lambda(1:3) - 2/3) < 100 * tol), ...
+            'Top throughput 2-cycle lambdas should equal 2/3.');
+
+        assert(all(abs(TopThr.lambda(4:5) - 1/3) < 100 * tol), ...
+            'Top throughput 3-cycle lambdas should equal 1/3.');
+
+        results.TopCyclesThroughput = TopThr;
+        results.TopCyclesVolume = TopVol;
+
+        [testNames, testPassed, testError] = recordPass(testNames, testPassed, testError, testName);
+
+    catch ME
+        [testNames, testPassed, testError] = recordFail(testNames, testPassed, testError, testName, ME);
+        if opts.StopOnFailure
+            rethrow(ME);
+        end
+    end
+
     %% Finish
 
     results.Tests = table(testNames, testPassed, testError, ...
