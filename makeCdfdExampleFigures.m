@@ -157,7 +157,8 @@ function results = makeCdfdExampleFigures(outputDir, varargin)
     Sigma(1,2) = -1;
     Sigma(2,1) = -1;
 
-    signed = localSignedCycleSummaries(Rtri.Tcycles, Sigma, [1 2]);
+    signed = cdfdSignedCycleSummaries(Rtri.Tcycles, Sigma, ...
+    'TargetEdges', [1 2]);
 
     if opts.Verbose
         fprintf('\nSigned summary:\n');
@@ -458,70 +459,6 @@ function fig = makeSignedOverlapFigure(Wtri, Sigma, signed, visibility)
     subtitle(ax2, sprintf('$T^{+}=%.3f,\\ T^{-}=%.3f,\\ V^{+}=%.3f,\\ V^{-}=%.3f$', ...
         signed.Tplus, signed.Tminus, signed.Vplus, signed.Vminus), ...
         'Interpreter', 'latex');
-end
-
-
-%% Signed local summary
-
-function signed = localSignedCycleSummaries(Tcycles, Sigma, targetEdge)
-% localSignedCycleSummaries
-% Compute signed feedback summaries from a cycle table and sign matrix.
-%
-% This is a local helper for the example figure. It can later be promoted
-% into a separate cdfdSignedCycleSummaries.m utility.
-
-    Tsigned = Tcycles;
-
-    polarity = zeros(height(Tsigned), 1);
-    containsTarget = false(height(Tsigned), 1);
-
-    for r = 1:height(Tsigned)
-        cyc = Tsigned.Cycle{r};
-        closedCyc = [cyc(:).' cyc(1)];
-
-        sig = 1;
-
-        for k = 1:numel(cyc)
-            i = closedCyc(k);
-            j = closedCyc(k+1);
-
-            sig = sig * Sigma(i,j);
-
-            if i == targetEdge(1) && j == targetEdge(2)
-                containsTarget(r) = true;
-            end
-        end
-
-        polarity(r) = sig;
-    end
-
-    Tsigned.Polarity = polarity;
-    Tsigned.ContainsTargetEdge = containsTarget;
-
-    positive = Tsigned.Polarity == 1;
-    negative = Tsigned.Polarity == -1;
-
-    signed = struct();
-    signed.CycleTable = Tsigned;
-
-    signed.Tplus = sum(Tsigned.lambda(positive));
-    signed.Tminus = sum(Tsigned.lambda(negative));
-    signed.Ttotal = signed.Tplus + signed.Tminus;
-
-    signed.Vplus = sum(Tsigned.lambda(positive) .* Tsigned.Length(positive));
-    signed.Vminus = sum(Tsigned.lambda(negative) .* Tsigned.Length(negative));
-    signed.Vtotal = signed.Vplus + signed.Vminus;
-
-    signed.ShareTplus = signed.Tplus / signed.Ttotal;
-    signed.ShareTminus = signed.Tminus / signed.Ttotal;
-
-    signed.ShareVplus = signed.Vplus / signed.Vtotal;
-    signed.ShareVminus = signed.Vminus / signed.Vtotal;
-
-    signed.TargetEdge = targetEdge;
-    signed.TargetEdgeCplus = sum(Tsigned.lambda(positive & containsTarget));
-    signed.TargetEdgeCminus = sum(Tsigned.lambda(negative & containsTarget));
-    signed.TargetEdgeCtotal = signed.TargetEdgeCplus + signed.TargetEdgeCminus;
 end
 
 
