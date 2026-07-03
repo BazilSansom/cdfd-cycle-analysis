@@ -27,6 +27,9 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
 %                                       Markov transitions per component
 %   'NumSamples'       default 10000. Used when BudgetMode='cycles'.
 %   'NumTransitions'   default 100000. Used when BudgetMode='transitions'.
+%   'BatchTransitions' default []. If non-empty, records fixed-batch
+%                      convergence diagnostics every BatchTransitions
+%                      transitions. Currently requires BudgetMode='transitions'.
 %   'Seed'             default []. If non-empty, calls rng(Seed).
 %   'TopK'             default Inf. Number of ranked observed cycles to return.
 %   'RankBy'           default 'throughput'. Passed to cdfdTopCycles.
@@ -51,7 +54,7 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
 %
 %        TopCycles        ranked observed cycles using cdfdTopCycles
 %
-%        Estimates        struct with aggregate Monte Carlo estimates:
+%        Estimates        aggregate Monte Carlo estimates:
 %                           V_C
 %                           T_C
 %                           Lbar_C
@@ -61,8 +64,15 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
 %                           NumSamples
 %                           NumTransitions
 %                           NumObservedCycles
+%                           NumComponents
 %
 %        ComponentTable   per-component simulation diagnostics
+%
+%        Convergence      convergence diagnostics:
+%                           ComponentTrace
+%                           Trace
+%                           Diagnostics
+%
 %        Options          parsed options
 %
 % NOTES
@@ -116,6 +126,7 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
     rowsComponentVolumeShare = zeros(0, 1);
 
     compRows = {};
+    traceTables = {};
 
     totalSamples = 0;
     totalTransitions = 0;
@@ -135,7 +146,7 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
 
         Tlocal = componentResult.CycleTable;
 
-        if ~isempty(Tlocal)
+        if height(Tlocal) > 0
             rowsComponent = [rowsComponent; Tlocal.Component]; %#ok<AGROW>
             rowsCycle = [rowsCycle; Tlocal.Cycle]; %#ok<AGROW>
             rowsLength = [rowsLength; Tlocal.Length]; %#ok<AGROW>
@@ -146,6 +157,10 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
             rowsTransitions = [rowsTransitions; Tlocal.NumTransitions]; %#ok<AGROW>
             rowsSamples = [rowsSamples; Tlocal.NumSamples]; %#ok<AGROW>
             rowsComponentVolumeShare = [rowsComponentVolumeShare; Tlocal.ComponentVolumeShare]; %#ok<AGROW>
+        end
+
+        if height(componentResult.Trace) > 0
+            traceTables{end+1, 1} = componentResult.Trace; %#ok<AGROW>
         end
 
         compRows(end+1, :) = { ...
@@ -201,7 +216,7 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
         } ...
     );
 
-    if ~isempty(CycleTable)
+    if height(CycleTable) > 0
         CycleTable = sortrows(CycleTable, {'lambda', 'Length'}, {'descend', 'ascend'});
     end
 
@@ -236,7 +251,7 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
         Lbar_hat = NaN;
     end
 
-    if isempty(CycleTable)
+    if height(CycleTable) == 0
         TopCycles = table();
     else
         TopCycles = cdfdTopCycles(CycleTable, ...
@@ -244,6 +259,15 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
             'RankBy', opts.RankBy, ...
             'Tol', tol);
     end
+
+    if isempty(traceTables)
+        ComponentTrace = table();
+    else
+        ComponentTrace = vertcat(traceTables{:});
+    end
+
+    [Trace, convergenceDiagnostics] = aggregateComponentTraces( ...
+        ComponentTrace, V_C, numel(components), tol);
 
     Estimates = struct();
     Estimates.V_C = V_C;
@@ -257,11 +281,17 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
     Estimates.NumObservedCycles = height(CycleTable);
     Estimates.NumComponents = numel(components);
 
+    Convergence = struct();
+    Convergence.ComponentTrace = ComponentTrace;
+    Convergence.Trace = Trace;
+    Convergence.Diagnostics = convergenceDiagnostics;
+
     MC = struct();
     MC.CycleTable = CycleTable;
     MC.TopCycles = TopCycles;
     MC.Estimates = Estimates;
     MC.ComponentTable = ComponentTable;
+    MC.Convergence = Convergence;
     MC.Options = opts;
 end
 
@@ -274,8 +304,6 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
 
     Csub = full(Csub);
     Csub(abs(Csub) <= tol) = 0;
-
-    m = size(Csub, 1);
 
     s = full(sum(Csub, 2));
     S = full(sum(s));
@@ -300,6 +328,17 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
 
     numSamples = 0;
     numTransitions = 0;
+    totalCycleLengthSum = 0;
+
+    traceEnabled = ~isempty(opts.BatchTransitions);
+    batchNumber = 0;
+    nextBatchTransition = opts.BatchTransitions;
+
+    batchStartTransitions = 0;
+    batchStartSamples = 0;
+    batchStartCycleLengthSum = 0;
+
+    traceRows = {};
 
     budgetMode = lower(string(opts.BudgetMode));
 
@@ -349,8 +388,183 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
             end
 
             numSamples = numSamples + 1;
+            totalCycleLengthSum = totalCycleLengthSum + numel(cycleCanonical);
+        end
+
+        if traceEnabled && numTransitions >= nextBatchTransition
+            batchNumber = batchNumber + 1;
+
+            traceRows(end+1, :) = makeComponentTraceRow( ...
+                componentIndex, ...
+                batchNumber, ...
+                S, ...
+                componentVolumeShare, ...
+                numSamples, ...
+                numTransitions, ...
+                totalCycleLengthSum, ...
+                cycleCount, ...
+                batchStartSamples, ...
+                batchStartTransitions, ...
+                batchStartCycleLengthSum, ...
+                tol); %#ok<AGROW>
+
+            batchStartTransitions = numTransitions;
+            batchStartSamples = numSamples;
+            batchStartCycleLengthSum = totalCycleLengthSum;
+            nextBatchTransition = nextBatchTransition + opts.BatchTransitions;
         end
     end
+
+    if traceEnabled
+        if batchNumber == 0 || batchStartTransitions < numTransitions
+            batchNumber = batchNumber + 1;
+
+            traceRows(end+1, :) = makeComponentTraceRow( ...
+                componentIndex, ...
+                batchNumber, ...
+                S, ...
+                componentVolumeShare, ...
+                numSamples, ...
+                numTransitions, ...
+                totalCycleLengthSum, ...
+                cycleCount, ...
+                batchStartSamples, ...
+                batchStartTransitions, ...
+                batchStartCycleLengthSum, ...
+                tol); %#ok<AGROW>
+        end
+    end
+
+    Tlocal = makeCycleTableFromCounts( ...
+        cycleCount, ...
+        cycleMap, ...
+        componentIndex, ...
+        S, ...
+        numTransitions, ...
+        numSamples, ...
+        componentVolumeShare);
+
+    T_C_hat = full(sum(Tlocal.lambda));
+    volumeFromCycles = full(sum(Tlocal.lambda .* Tlocal.Length));
+
+    if T_C_hat > tol
+        Lbar_hat = S / T_C_hat;
+    else
+        Lbar_hat = NaN;
+    end
+
+    volumeRelError = abs(volumeFromCycles - S) / max(1, abs(S));
+
+    if isempty(traceRows)
+        Trace = table();
+    else
+        Trace = cell2table(traceRows, ...
+            'VariableNames', { ...
+                'Component', ...
+                'Batch', ...
+                'S', ...
+                'ComponentVolumeShare', ...
+                'CumulativeSamples', ...
+                'CumulativeTransitions', ...
+                'ObservedCycles', ...
+                'T_C', ...
+                'Lbar_C', ...
+                'VolumeFromCycles', ...
+                'VolumeRelError', ...
+                'BatchSamples', ...
+                'BatchTransitions', ...
+                'Batch_T_C', ...
+                'Batch_Lbar_C', ...
+                'BatchVolumeFromCycles', ...
+                'BatchVolumeRelError' ...
+            });
+    end
+
+    result = struct();
+    result.CycleTable = Tlocal;
+    result.Trace = Trace;
+    result.S = S;
+    result.ComponentVolumeShare = componentVolumeShare;
+    result.NumSamples = numSamples;
+    result.NumTransitions = numTransitions;
+    result.NumObservedCycles = height(Tlocal);
+    result.T_C = T_C_hat;
+    result.Lbar_C = Lbar_hat;
+    result.VolumeFromCycles = volumeFromCycles;
+    result.VolumeRelError = volumeRelError;
+end
+
+
+function row = makeComponentTraceRow(componentIndex, batchNumber, S, componentVolumeShare, ...
+    numSamples, numTransitions, totalCycleLengthSum, cycleCount, ...
+    batchStartSamples, batchStartTransitions, batchStartCycleLengthSum, tol)
+% makeComponentTraceRow
+% Build one per-component convergence trace row.
+
+    observedCycles = cycleCount.Count;
+
+    if numTransitions > 0
+        T_C = S * numSamples / numTransitions;
+        volumeFromCycles = S * totalCycleLengthSum / numTransitions;
+    else
+        T_C = NaN;
+        volumeFromCycles = NaN;
+    end
+
+    if T_C > tol
+        Lbar_C = S / T_C;
+    else
+        Lbar_C = NaN;
+    end
+
+    volumeRelError = abs(volumeFromCycles - S) / max(1, abs(S));
+
+    batchSamples = numSamples - batchStartSamples;
+    batchTransitions = numTransitions - batchStartTransitions;
+    batchCycleLengthSum = totalCycleLengthSum - batchStartCycleLengthSum;
+
+    if batchTransitions > 0
+        batchT_C = S * batchSamples / batchTransitions;
+        batchVolumeFromCycles = S * batchCycleLengthSum / batchTransitions;
+    else
+        batchT_C = NaN;
+        batchVolumeFromCycles = NaN;
+    end
+
+    if batchT_C > tol
+        batchLbar_C = S / batchT_C;
+    else
+        batchLbar_C = NaN;
+    end
+
+    batchVolumeRelError = abs(batchVolumeFromCycles - S) / max(1, abs(S));
+
+    row = { ...
+        componentIndex, ...
+        batchNumber, ...
+        S, ...
+        componentVolumeShare, ...
+        numSamples, ...
+        numTransitions, ...
+        observedCycles, ...
+        T_C, ...
+        Lbar_C, ...
+        volumeFromCycles, ...
+        volumeRelError, ...
+        batchSamples, ...
+        batchTransitions, ...
+        batchT_C, ...
+        batchLbar_C, ...
+        batchVolumeFromCycles, ...
+        batchVolumeRelError ...
+    };
+end
+
+
+function Tlocal = makeCycleTableFromCounts(cycleCount, cycleMap, componentIndex, S, ...
+    numTransitions, numSamples, componentVolumeShare)
+% makeCycleTableFromCounts
+% Convert cycle-count maps into an estimated cycle table.
 
     keys = cycleCount.keys;
     numObserved = numel(keys);
@@ -411,40 +625,145 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
         } ...
     );
 
-    if ~isempty(Tlocal)
+    if height(Tlocal) > 0
         Tlocal = sortrows(Tlocal, {'lambda', 'Length'}, {'descend', 'ascend'});
     end
+end
 
-    T_C_hat = full(sum(Tlocal.lambda));
-    volumeFromCycles = full(sum(Tlocal.lambda .* Tlocal.Length));
 
-    if T_C_hat > tol
-        Lbar_hat = S / T_C_hat;
-    else
-        Lbar_hat = NaN;
+function [Trace, diagnostics] = aggregateComponentTraces(ComponentTrace, V_C, numComponents, tol)
+% aggregateComponentTraces
+% Aggregate component-level trace rows into network-level batch trace.
+
+    diagnostics = struct();
+    diagnostics.Enabled = height(ComponentTrace) > 0;
+    diagnostics.NumComponentTraceRows = height(ComponentTrace);
+    diagnostics.NumBatches = 0;
+    diagnostics.FinalRelChangeT_C = NaN;
+    diagnostics.FinalRelChangeLbar_C = NaN;
+    diagnostics.MCSE_T_C = NaN;
+    diagnostics.MCSE_Lbar_C = NaN;
+    diagnostics.StopReason = "fixed_budget";
+
+    if height(ComponentTrace) == 0
+        Trace = table();
+        return;
     end
 
-    volumeRelError = abs(volumeFromCycles - S) / max(1, abs(S));
+    batches = unique(ComponentTrace.Batch);
+    rows = {};
 
-    result = struct();
-    result.CycleTable = Tlocal;
-    result.S = S;
-    result.ComponentVolumeShare = componentVolumeShare;
-    result.NumSamples = numSamples;
-    result.NumTransitions = numTransitions;
-    result.NumObservedCycles = numObserved;
-    result.T_C = T_C_hat;
-    result.Lbar_C = Lbar_hat;
-    result.VolumeFromCycles = volumeFromCycles;
-    result.VolumeRelError = volumeRelError;
+    for k = 1:numel(batches)
+        b = batches(k);
+        sub = ComponentTrace(ComponentTrace.Batch == b, :);
+
+        % Only aggregate batches for which all components have a row.
+        if height(sub) ~= numComponents
+            continue;
+        end
+
+        cumulativeSamples = full(sum(sub.CumulativeSamples));
+        cumulativeTransitions = full(sum(sub.CumulativeTransitions));
+        observedCycles = full(sum(sub.ObservedCycles));
+
+        T_C = full(sum(sub.T_C));
+
+        if T_C > tol
+            Lbar_C = V_C / T_C;
+        else
+            Lbar_C = NaN;
+        end
+
+        volumeFromCycles = full(sum(sub.VolumeFromCycles));
+        volumeGap = volumeFromCycles - V_C;
+        volumeRelError = abs(volumeGap) / max(1, abs(V_C));
+
+        batchSamples = full(sum(sub.BatchSamples));
+        batchTransitions = full(sum(sub.BatchTransitions));
+
+        batchT_C = full(sum(sub.Batch_T_C));
+
+        if batchT_C > tol
+            batchLbar_C = V_C / batchT_C;
+        else
+            batchLbar_C = NaN;
+        end
+
+        batchVolumeFromCycles = full(sum(sub.BatchVolumeFromCycles));
+        batchVolumeGap = batchVolumeFromCycles - V_C;
+        batchVolumeRelError = abs(batchVolumeGap) / max(1, abs(V_C));
+
+        rows(end+1, :) = { ...
+            b, ...
+            cumulativeSamples, ...
+            cumulativeTransitions, ...
+            observedCycles, ...
+            T_C, ...
+            Lbar_C, ...
+            volumeFromCycles, ...
+            volumeGap, ...
+            volumeRelError, ...
+            batchSamples, ...
+            batchTransitions, ...
+            batchT_C, ...
+            batchLbar_C, ...
+            batchVolumeFromCycles, ...
+            batchVolumeGap, ...
+            batchVolumeRelError ...
+        }; %#ok<AGROW>
+    end
+
+    if isempty(rows)
+        Trace = table();
+        return;
+    end
+
+    Trace = cell2table(rows, ...
+        'VariableNames', { ...
+            'Batch', ...
+            'CumulativeSamples', ...
+            'CumulativeTransitions', ...
+            'ObservedCycles', ...
+            'T_C', ...
+            'Lbar_C', ...
+            'VolumeFromCycles', ...
+            'VolumeGap', ...
+            'VolumeRelError', ...
+            'BatchSamples', ...
+            'BatchTransitions', ...
+            'Batch_T_C', ...
+            'Batch_Lbar_C', ...
+            'BatchVolumeFromCycles', ...
+            'BatchVolumeGap', ...
+            'BatchVolumeRelError' ...
+        });
+
+    diagnostics.NumBatches = height(Trace);
+
+    if height(Trace) >= 2
+        diagnostics.FinalRelChangeT_C = abs(Trace.T_C(end) - Trace.T_C(end-1)) / ...
+            max(1, abs(Trace.T_C(end)));
+
+        diagnostics.FinalRelChangeLbar_C = abs(Trace.Lbar_C(end) - Trace.Lbar_C(end-1)) / ...
+            max(1, abs(Trace.Lbar_C(end)));
+    end
+
+    validT = Trace.Batch_T_C(isfinite(Trace.Batch_T_C));
+    validL = Trace.Batch_Lbar_C(isfinite(Trace.Batch_Lbar_C));
+
+    if numel(validT) >= 2
+        diagnostics.MCSE_T_C = std(validT) / sqrt(numel(validT));
+    end
+
+    if numel(validL) >= 2
+        diagnostics.MCSE_Lbar_C = std(validL) / sqrt(numel(validL));
+    end
 end
 
 
 function components = getPositiveSupportComponents(C, tol)
 % getPositiveSupportComponents
 % Return components of the positive support with positive edge-flow volume.
-
-    n = size(C, 1);
 
     A = C > tol;
 
@@ -581,11 +900,26 @@ function MC = emptyMonteCarloOutput(n, V_C, opts)
     Estimates.NumObservedCycles = 0;
     Estimates.NumComponents = 0;
 
+    Convergence = struct();
+    Convergence.ComponentTrace = table();
+    Convergence.Trace = table();
+    Convergence.Diagnostics = struct( ...
+        'Enabled', false, ...
+        'NumComponentTraceRows', 0, ...
+        'NumBatches', 0, ...
+        'FinalRelChangeT_C', NaN, ...
+        'FinalRelChangeLbar_C', NaN, ...
+        'MCSE_T_C', NaN, ...
+        'MCSE_Lbar_C', NaN, ...
+        'StopReason', "empty" ...
+    );
+
     MC = struct();
     MC.CycleTable = CycleTable;
     MC.TopCycles = table();
     MC.Estimates = Estimates;
     MC.ComponentTable = table();
+    MC.Convergence = Convergence;
     MC.Options = opts;
     MC.NumNodes = n;
 end
@@ -614,6 +948,7 @@ function opts = parseMonteCarloOptions(varargin)
     opts.BudgetMode = 'cycles';
     opts.NumSamples = 10000;
     opts.NumTransitions = 100000;
+    opts.BatchTransitions = [];
     opts.Seed = [];
     opts.TopK = Inf;
     opts.RankBy = 'throughput';
@@ -642,6 +977,9 @@ function opts = parseMonteCarloOptions(varargin)
             case 'numtransitions'
                 opts.NumTransitions = value;
 
+            case 'batchtransitions'
+                opts.BatchTransitions = value;
+
             case 'seed'
                 opts.Seed = value;
 
@@ -667,6 +1005,14 @@ function opts = parseMonteCarloOptions(varargin)
 
     validatePositiveIntegerLike(opts.NumSamples, 'NumSamples');
     validatePositiveIntegerLike(opts.NumTransitions, 'NumTransitions');
+
+    if ~isempty(opts.BatchTransitions)
+        validatePositiveIntegerLike(opts.BatchTransitions, 'BatchTransitions');
+
+        if lower(string(opts.BudgetMode)) ~= "transitions"
+            error('BatchTransitions currently requires BudgetMode=''transitions''.');
+        end
+    end
 
     if ~isinf(opts.MaxTransitions)
         validatePositiveIntegerLike(opts.MaxTransitions, 'MaxTransitions');
