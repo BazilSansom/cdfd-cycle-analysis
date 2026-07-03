@@ -15,6 +15,8 @@ function [T, status] = cdfdExactAllCycles(C, varargin)
 %   'MaxCycles'            default 50000
 %   'CheckBalance'         default true
 %   'CheckReconstruction'  default true
+%   'MaxTotalCycleLength'  default 5e6
+%   'MaxRuntimeSeconds'    default 60
 %
 % OUTPUT
 %   T      table with columns:
@@ -22,6 +24,8 @@ function [T, status] = cdfdExactAllCycles(C, varargin)
 %
 %   status struct with fields:
 %          Complete, NumCycles, ReconstructionError, ComponentStatus
+%          MaxCycles, MaxTotalCycleLength, MaxRuntimeSeconds,
+%          TotalCycleLength, RuntimeSeconds
 %
 % NOTES
 %   Requires MATLAB R2021a or later for allcycles when non-self cycles
@@ -33,6 +37,9 @@ function [T, status] = cdfdExactAllCycles(C, varargin)
 
     opts = parseExactAllOptions(varargin{:});
     tol = opts.Tol;
+
+    runStartTic = tic;
+    totalCycleLength = 0;
 
     validateSquareNonnegative(C, tol);
 
@@ -75,6 +82,11 @@ function [T, status] = cdfdExactAllCycles(C, varargin)
     status.NumCycles = 0;
     status.ReconstructionError = NaN;
     status.ComponentStatus = table();
+    status.MaxCycles = opts.MaxCycles;
+    status.MaxTotalCycleLength = opts.MaxTotalCycleLength;
+    status.MaxRuntimeSeconds = opts.MaxRuntimeSeconds;
+    status.TotalCycleLength = 0;
+    status.RuntimeSeconds = NaN;
 
     hasAllCycles = ~isempty(which('allcycles'));
 
@@ -112,6 +124,15 @@ function [T, status] = cdfdExactAllCycles(C, varargin)
 
         remainingAfterSelf = remaining - numel(cyclesLocal);
 
+        componentCycleLength = sum(cellfun(@numel, cyclesLocal));
+
+        if totalCycleLength + componentCycleLength > opts.MaxTotalCycleLength
+            error(['Exact cycle enumeration exceeded MaxTotalCycleLength=%d. ' ...
+                'No exact all-cycle result returned. Use streaming Monte Carlo ' ...
+                'or increase MaxTotalCycleLength if full enumeration is intended.'], ...
+                opts.MaxTotalCycleLength);
+        end
+
         % Enumerate non-self simple cycles using allcycles.
         if nnz(Asub) > 0
             if ~hasAllCycles
@@ -130,21 +151,38 @@ function [T, status] = cdfdExactAllCycles(C, varargin)
 
             % Request one extra cycle to detect whether this component exceeds
             % the remaining all-cycle budget.
-            cyclesNonself = allcycles(G, ...
-                'MinCycleLength', 2, ...
-                'MaxNumCycles', remainingAfterSelf + 1);
+            cyclesNonself = guardedAllcycles(G, remainingAfterSelf, opts);
 
-            if numel(cyclesNonself) > remainingAfterSelf
-                error(['Full cycle enumeration exceeded MaxCycles=%d. ' ...
-                       'No exact all-cycle result returned. Use streaming Monte Carlo ' ...
-                       'or increase MaxCycles if full enumeration is intended.'], ...
-                       opts.MaxCycles);
+            nonselfCycleLength = sum(cellfun(@numel, cyclesNonself));
+
+            if totalCycleLength + componentCycleLength + nonselfCycleLength > opts.MaxTotalCycleLength
+                error(['Exact cycle enumeration exceeded MaxTotalCycleLength=%d. ' ...
+                    'No exact all-cycle result returned. Use streaming Monte Carlo ' ...
+                    'or increase MaxTotalCycleLength if full enumeration is intended.'], ...
+                    opts.MaxTotalCycleLength);
             end
 
             cyclesLocal = [cyclesLocal; cyclesNonself(:)];
+
+            %componentCycleLength = sum(cellfun(@numel, cyclesLocal));
+            %totalCycleLength = totalCycleLength + componentCycleLength;
+
         end
 
+        componentCycleLength = sum(cellfun(@numel, cyclesLocal));
+
+        if totalCycleLength + componentCycleLength > opts.MaxTotalCycleLength
+            error(['Exact cycle enumeration exceeded MaxTotalCycleLength=%d. ' ...
+                'No exact all-cycle result returned. Use streaming Monte Carlo ' ...
+                'or increase MaxTotalCycleLength if full enumeration is intended.'], ...
+                opts.MaxTotalCycleLength);
+        end
+
+        totalCycleLength = totalCycleLength + componentCycleLength;
+
         for r = 1:numel(cyclesLocal)
+
+            guardExactRuntime(runStartTic, opts);
             cycLocal = cyclesLocal{r}(:).';
             cycGlobal = nodes(cycLocal);
 
@@ -203,6 +241,10 @@ function [T, status] = cdfdExactAllCycles(C, varargin)
                    status.ReconstructionError);
         end
     end
+
+    status.TotalCycleLength = totalCycleLength;
+    status.RuntimeSeconds = toc(runStartTic);
+
 end
 
 
@@ -338,9 +380,12 @@ end
 
 
 function opts = parseExactAllOptions(varargin)
+
     opts = struct();
     opts.Tol = 1e-12;
     opts.MaxCycles = 50000;
+    opts.MaxTotalCycleLength = 5e6;
+    opts.MaxRuntimeSeconds = 60;
     opts.CheckBalance = true;
     opts.CheckReconstruction = true;
 
@@ -361,8 +406,88 @@ function opts = parseExactAllOptions(varargin)
                 opts.CheckBalance = value;
             case 'checkreconstruction'
                 opts.CheckReconstruction = value;
+            case 'maxtotalcyclelength'
+                opts.MaxTotalCycleLength = value;
+            case 'maxruntimeseconds'
+                opts.MaxRuntimeSeconds = value;
             otherwise
                 error('Unknown option: %s', name);
         end
     end
+
+    validatePositiveIntegerLike(opts.MaxCycles, 'MaxCycles');
+    validatePositiveIntegerLike(opts.MaxTotalCycleLength, 'MaxTotalCycleLength');
+    validatePositiveFiniteScalar(opts.MaxRuntimeSeconds, 'MaxRuntimeSeconds');
+    validatePositiveFiniteScalar(opts.Tol, 'Tol');
+
+    if ~islogical(opts.CheckBalance) && ~ismember(opts.CheckBalance, [0 1])
+        error('CheckBalance must be true or false.');
+    end
+
+    if ~islogical(opts.CheckReconstruction) && ~ismember(opts.CheckReconstruction, [0 1])
+        error('CheckReconstruction must be true or false.');
+    end
+
 end
+
+function cycles = guardedAllcycles(G, remainingBudget, opts)
+% guardedAllcycles
+% Hard-guarded wrapper around MATLAB allcycles.
+%
+% This intentionally does not fall back to unguarded allcycles. Exact
+% all-cycle enumeration must fail rather than launch an unbounded
+% enumeration.
+
+    validatePositiveIntegerLike(remainingBudget, 'remainingBudget');
+
+    if remainingBudget <= 0
+        error(['Full cycle enumeration exceeded MaxCycles=%d. ' ...
+               'No exact all-cycle result returned. Use streaming Monte Carlo ' ...
+               'or increase MaxCycles if full enumeration is intended.'], ...
+               opts.MaxCycles);
+    end
+
+    cycles = allcycles(G, ...
+        'MinCycleLength', 2, ...
+        'MaxNumCycles', remainingBudget + 1);
+
+    if numel(cycles) > remainingBudget
+        error(['Full cycle enumeration exceeded MaxCycles=%d. ' ...
+               'No exact all-cycle result returned. Use streaming Monte Carlo ' ...
+               'or increase MaxCycles if full enumeration is intended.'], ...
+               opts.MaxCycles);
+    end
+end
+
+
+function guardExactRuntime(runStartTic, opts)
+% guardExactRuntime
+% Runtime guard for post-enumeration work.
+%
+% Note: this cannot interrupt MATLAB while it is inside allcycles. The
+% hard guard against excessive cycle materialisation is MaxNumCycles.
+
+    elapsed = toc(runStartTic);
+
+    if elapsed > opts.MaxRuntimeSeconds
+        error(['Exact cycle analysis exceeded MaxRuntimeSeconds=%.3g. ' ...
+               'No exact all-cycle result returned. Use streaming Monte Carlo ' ...
+               'or increase MaxRuntimeSeconds if full exact weighting is intended.'], ...
+               opts.MaxRuntimeSeconds);
+    end
+end
+
+
+function validatePositiveIntegerLike(x, name)
+    if ~isnumeric(x) || ~isscalar(x) || ~isfinite(x) || x < 0 || floor(x) ~= x
+        error('%s must be a non-negative finite integer scalar.', name);
+    end
+end
+
+
+function validatePositiveFiniteScalar(x, name)
+    if ~isnumeric(x) || ~isscalar(x) || ~isfinite(x) || x <= 0
+        error('%s must be a positive finite scalar.', name);
+    end
+end
+
