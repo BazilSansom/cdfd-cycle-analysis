@@ -36,6 +36,14 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
 %   'CheckBalance'     default true.
 %   'Verbose'          default true.
 %   'MaxTransitions'   default Inf. Safety cap per component.
+%   'MaxRuntimeSeconds'      default Inf. Global runtime cap.
+%   'MaxObservedCycles'      default Inf. Cap on distinct observed cycles
+%                            stored per component.
+%   'MaxPathLengthFactor'    default 1. Maximum loop-erased path length is
+%                            ceil(MaxPathLengthFactor * component size).
+%   'CheckIntervalTransitions'
+%                            default 1000. Frequency of runtime checks.
+%   'GuardrailAction'        default 'stop'. Either 'stop' or 'error'.
 %
 % OUTPUT
 %   MC   struct with fields:
@@ -85,6 +93,8 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
     opts = parseMonteCarloOptions(varargin{:});
     tol = opts.Tol;
 
+    opts.RunStartTic = tic;
+
     validateSquareNonnegative(C, tol);
 
     if ~isempty(opts.Seed)
@@ -128,6 +138,8 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
     compRows = {};
     traceTables = {};
     componentStopReasons = strings(0, 1);
+    componentGuardrailHits = false(0, 1);
+    componentGuardrailMessages = strings(0, 1);
 
     totalSamples = 0;
     totalTransitions = 0;
@@ -142,6 +154,8 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
 
         componentResult = simulateComponent(Csub, nodes, a, V_C, opts);
         componentStopReasons(end+1, 1) = string(componentResult.StopReason); %#ok<AGROW>
+        componentGuardrailHits(end+1, 1) = componentResult.GuardrailHit; %#ok<AGROW>
+        componentGuardrailMessages(end+1, 1) = string(componentResult.GuardrailMessage); %#ok<AGROW>
 
         totalSamples = totalSamples + componentResult.NumSamples;
         totalTransitions = totalTransitions + componentResult.NumTransitions;
@@ -177,8 +191,10 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
             componentResult.T_C, ...
             componentResult.Lbar_C, ...
             componentResult.VolumeFromCycles, ...
-            componentResult.VolumeRelError ...
-            componentResult.StopReason ...
+            componentResult.VolumeRelError, ...
+            componentResult.StopReason, ...
+            componentResult.GuardrailHit, ...
+            componentResult.GuardrailMessage ...
         }; %#ok<AGROW>
 
         if opts.Verbose
@@ -191,6 +207,11 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
                 componentResult.NumTransitions, ...
                 componentResult.NumObservedCycles, ...
                 componentResult.T_C);
+        end
+
+        if componentResult.GuardrailHit && ...
+                string(componentResult.StopReason) == "max_runtime_seconds"
+            break;
         end
     end
 
@@ -239,8 +260,10 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
                 'T_C', ...
                 'Lbar_C', ...
                 'VolumeFromCycles', ...
-                'VolumeRelError' ...
-                'StopReason' ...
+                'VolumeRelError', ...
+                'StopReason', ...
+                'GuardrailHit', ...
+                'GuardrailMessage' ...
             });
     end
 
@@ -270,20 +293,40 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
         ComponentTrace = vertcat(traceTables{:});
     end
 
+    numComponentsTotal = numel(components);
+    numComponentsSimulated = numel(componentStopReasons);
+
     [Trace, convergenceDiagnostics] = aggregateComponentTraces( ...
-        ComponentTrace, V_C, numel(components), tol);
-    
-    if lower(string(opts.BudgetMode)) == "adaptive"
+        ComponentTrace, V_C, numComponentsSimulated, tol);
+
+    %[Trace, convergenceDiagnostics] = aggregateComponentTraces( ...
+    %    ComponentTrace, V_C, numel(components), tol);
+
+    if any(componentGuardrailHits)
+        convergenceDiagnostics.StopReason = "guardrail_hit";
+
+    elseif lower(string(opts.BudgetMode)) == "adaptive"
         if all(componentStopReasons == "adaptive_stable")
             convergenceDiagnostics.StopReason = "adaptive_stable";
         else
             convergenceDiagnostics.StopReason = "max_batches_or_component_limit";
         end
+
+    elseif lower(string(opts.BudgetMode)) == "transitions"
+        convergenceDiagnostics.StopReason = "fixed_transitions";
+
+    elseif lower(string(opts.BudgetMode)) == "cycles"
+        convergenceDiagnostics.StopReason = "fixed_cycles";
+
     else
         convergenceDiagnostics.StopReason = "fixed_budget";
     end
 
+    convergenceDiagnostics.GuardrailHit = any(componentGuardrailHits);
     convergenceDiagnostics.ComponentStopReasons = componentStopReasons;
+    convergenceDiagnostics.ComponentGuardrailHits = componentGuardrailHits;
+    convergenceDiagnostics.ComponentGuardrailMessages = componentGuardrailMessages;
+
 
     Estimates = struct();
     Estimates.V_C = V_C;
@@ -295,7 +338,12 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
     Estimates.NumSamples = totalSamples;
     Estimates.NumTransitions = totalTransitions;
     Estimates.NumObservedCycles = height(CycleTable);
-    Estimates.NumComponents = numel(components);
+    %Estimates.NumComponents = numel(components);
+    Estimates.NumComponents = numComponentsSimulated;
+    Estimates.NumComponentsTotal = numComponentsTotal;
+    Estimates.NumComponentsSimulated = numComponentsSimulated;
+    Estimates.GuardrailHit = any(componentGuardrailHits);
+    Estimates.StopReason = convergenceDiagnostics.StopReason;
 
     Convergence = struct();
     Convergence.ComponentTrace = ComponentTrace;
@@ -365,6 +413,11 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
     adaptiveStop = false;
     stopReason = "fixed_budget";
 
+    guardrailHit = false;
+    guardrailMessage = "";
+
+    maxPathLength = max(1, ceil(opts.MaxPathLengthFactor * numel(globalNodes)));
+
     if budgetMode == "adaptive"
         stopReason = "max_batches";
     end
@@ -397,10 +450,32 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
                 error('BudgetMode must be cycles, transitions, or adaptive.');
         end
 
-        if numTransitions >= opts.MaxTransitions
-            stopReason = "max_transitions";
-            error('Component %d reached MaxTransitions=%g before completing requested budget.', ...
-                componentIndex, opts.MaxTransitions);
+        if mod(numTransitions, opts.CheckIntervalTransitions) == 0
+            if ~isinf(opts.MaxRuntimeSeconds) && ...
+                    toc(opts.RunStartTic) > opts.MaxRuntimeSeconds
+
+                [guardrailHit, guardrailMessage, stopReason] = handleMonteCarloGuardrail( ...
+                    guardrailHit, ...
+                    guardrailMessage, ...
+                    "max_runtime_seconds", ...
+                    sprintf('Monte Carlo exceeded MaxRuntimeSeconds=%.3g.', ...
+                        opts.MaxRuntimeSeconds), ...
+                    opts);
+
+                break;
+            end
+        end
+
+       if numTransitions >= opts.MaxTransitions
+            [guardrailHit, guardrailMessage, stopReason] = handleMonteCarloGuardrail( ...
+                guardrailHit, ...
+                guardrailMessage, ...
+                "max_transitions", ...
+                sprintf('Component %d reached MaxTransitions=%g.', ...
+                    componentIndex, opts.MaxTransitions), ...
+                opts);
+
+            break;
         end
 
         current = path(end);
@@ -412,6 +487,18 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
 
         if isempty(previousPosition)
             path(end+1) = next; %#ok<AGROW>
+
+            if numel(path) > maxPathLength
+                [guardrailHit, guardrailMessage, stopReason] = handleMonteCarloGuardrail( ...
+                    guardrailHit, ...
+                    guardrailMessage, ...
+                    "max_path_length", ...
+                    sprintf('Component %d exceeded MaxPathLength=%d.', ...
+                        componentIndex, maxPathLength), ...
+                    opts);
+
+                break;
+            end
         else
             cycleLocal = path(previousPosition:end);
             path = path(1:previousPosition);
@@ -423,8 +510,22 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
             if isKey(cycleCount, key)
                 cycleCount(key) = cycleCount(key) + 1;
             else
+                if cycleCount.Count >= opts.MaxObservedCycles
+                    numTransitions = numTransitions - 1;
+                    [guardrailHit, guardrailMessage, stopReason] = handleMonteCarloGuardrail( ...
+                        guardrailHit, ...
+                        guardrailMessage, ...
+                        "max_observed_cycles", ...
+                        sprintf(['Component %d reached MaxObservedCycles=%g. ', ...
+                            'Increase MaxObservedCycles or use a more targeted analysis.'], ...
+                            componentIndex, opts.MaxObservedCycles), ...
+                        opts);
+                        break;
+                end
+
                 cycleCount(key) = 1;
                 cycleMap(key) = cycleCanonical;
+
             end
 
             numSamples = numSamples + 1;
@@ -549,6 +650,9 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
     result.VolumeFromCycles = volumeFromCycles;
     result.VolumeRelError = volumeRelError;
     result.StopReason = stopReason;
+    result.GuardrailHit = guardrailHit;
+    result.GuardrailMessage = guardrailMessage;
+
 end
 
 
@@ -701,6 +805,10 @@ function [Trace, diagnostics] = aggregateComponentTraces(ComponentTrace, V_C, nu
     diagnostics.MCSE_T_C = NaN;
     diagnostics.MCSE_Lbar_C = NaN;
     diagnostics.StopReason = "fixed_budget";
+    diagnostics.GuardrailHit = false;
+    diagnostics.ComponentStopReasons = strings(0, 1);
+    diagnostics.ComponentGuardrailHits = false(0, 1);
+    diagnostics.ComponentGuardrailMessages = strings(0, 1);
 
     if height(ComponentTrace) == 0
         Trace = table();
@@ -956,11 +1064,13 @@ function MC = emptyMonteCarloOutput(n, V_C, opts)
     Estimates.NumTransitions = 0;
     Estimates.NumObservedCycles = 0;
     Estimates.NumComponents = 0;
+    Estimates.GuardrailHit = false;
+    Estimates.StopReason = "empty";
 
     Convergence = struct();
     Convergence.ComponentTrace = table();
     Convergence.Trace = table();
-    Convergence.Diagnostics = struct( ...
+   Convergence.Diagnostics = struct( ...
         'Enabled', false, ...
         'NumComponentTraceRows', 0, ...
         'NumBatches', 0, ...
@@ -968,7 +1078,11 @@ function MC = emptyMonteCarloOutput(n, V_C, opts)
         'FinalRelChangeLbar_C', NaN, ...
         'MCSE_T_C', NaN, ...
         'MCSE_Lbar_C', NaN, ...
-        'StopReason', "empty" ...
+        'StopReason', "empty", ...
+        'GuardrailHit', false, ...
+        'ComponentStopReasons', strings(0, 1), ...
+        'ComponentGuardrailHits', false(0, 1), ...
+        'ComponentGuardrailMessages', strings(0, 1) ...
     );
 
     MC = struct();
@@ -1011,6 +1125,11 @@ function opts = parseMonteCarloOptions(varargin)
     opts.CheckBalance = true;
     opts.Verbose = true;
     opts.MaxTransitions = Inf;
+    opts.MaxRuntimeSeconds = Inf;
+    opts.MaxObservedCycles = Inf;
+    opts.MaxPathLengthFactor = 1;
+    opts.CheckIntervalTransitions = 1000;
+    opts.GuardrailAction = 'stop';
 
     % Adaptive stopping options.
     opts.MinBatches = 10;
@@ -1076,6 +1195,21 @@ function opts = parseMonteCarloOptions(varargin)
             case {'reltollbar_c', 'reltollbar'}
                 opts.RelTolLbar_C = value;
 
+            case 'maxruntimeseconds'
+                opts.MaxRuntimeSeconds = value;
+
+            case 'maxobservedcycles'
+                opts.MaxObservedCycles = value;
+
+            case 'maxpathlengthfactor'
+                opts.MaxPathLengthFactor = value;
+
+            case 'checkintervaltransitions'
+                opts.CheckIntervalTransitions = value;
+
+            case 'guardrailaction'
+                opts.GuardrailAction = value;
+
             otherwise
                 error('Unknown option: %s.', name);
         end
@@ -1118,6 +1252,38 @@ function opts = parseMonteCarloOptions(varargin)
     if ~isinf(opts.MaxTransitions)
         validatePositiveIntegerLike(opts.MaxTransitions, 'MaxTransitions');
     end
+
+    if ~isinf(opts.MaxRuntimeSeconds)
+        validatePositiveScalar(opts.MaxRuntimeSeconds, 'MaxRuntimeSeconds');
+    end
+
+    if ~isinf(opts.MaxObservedCycles)
+        validatePositiveIntegerLike(opts.MaxObservedCycles, 'MaxObservedCycles');
+    end
+
+    validatePositiveScalar(opts.MaxPathLengthFactor, 'MaxPathLengthFactor');
+    validatePositiveIntegerLike(opts.CheckIntervalTransitions, 'CheckIntervalTransitions');
+
+    guardrailAction = lower(string(opts.GuardrailAction));
+    if ~ismember(guardrailAction, ["stop", "error"])
+        error('GuardrailAction must be ''stop'' or ''error''.');
+    end
+
+    if budgetMode == "transitions" && ~isinf(opts.MaxTransitions)
+        if opts.MaxTransitions < opts.NumTransitions
+            error('MaxTransitions must be at least NumTransitions when BudgetMode=''transitions''.');
+        end
+    end
+
+    if budgetMode == "adaptive" && ~isinf(opts.MaxTransitions)
+        minAdaptiveTransitions = opts.MinBatches * opts.BatchTransitions;
+
+        if opts.MaxTransitions < minAdaptiveTransitions
+            error(['MaxTransitions is too small for adaptive mode. It must be at least ', ...
+                'MinBatches * BatchTransitions.']);
+        end
+    end
+
 end
 
 
@@ -1166,3 +1332,20 @@ function stable = isAdaptiveStable(traceTC, traceLbar, batchNumber, opts)
     stable = all(relChangeTC <= opts.RelTolT_C) && ...
              all(relChangeLbar <= opts.RelTolLbar_C);
 end
+
+function [guardrailHit, guardrailMessage, stopReason] = handleMonteCarloGuardrail( ...
+    guardrailHit, guardrailMessage, stopReason, message, opts)
+% handleMonteCarloGuardrail
+% Apply Monte Carlo guardrail policy.
+%
+% GuardrailAction='stop' returns a partial Monte Carlo result marked with
+% the relevant stop reason. GuardrailAction='error' fails immediately.
+
+    guardrailHit = true;
+    guardrailMessage = string(message);
+
+    if strcmpi(opts.GuardrailAction, 'error')
+        error('%s', message);
+    end
+end
+
