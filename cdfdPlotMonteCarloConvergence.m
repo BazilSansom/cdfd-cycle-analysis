@@ -4,19 +4,22 @@ function out = cdfdPlotMonteCarloConvergence(MC, varargin)
 %
 % PURPOSE
 %   Visualise batch convergence from cdfdCycleMonteCarlo.m. The function
-%   plots cumulative estimates of:
+%   plots cumulative estimates, or relative errors when exact/reference
+%   values are supplied, for:
 %
 %       T_C      completed circular throughput
 %       Lbar_C   mean cycle length
 %
-%   against cumulative Markov transitions. Optionally, exact reference
-%   values can be supplied.
+%   against cumulative Markov transitions.
 %
 % INPUT
 %   MC   output struct from cdfdCycleMonteCarlo, with:
 %          MC.Convergence.Trace
 %
 % OPTIONS
+%   'PlotMode'           default 'estimate'. One of:
+%                           'estimate'
+%                           'relative_error'
 %   'ExactT_C'           default []. Optional exact/reference T_C.
 %   'ExactLbar_C'        default []. Optional exact/reference Lbar_C.
 %   'ShowBatchEstimates' default true. Overlay batch-only estimates.
@@ -34,20 +37,17 @@ function out = cdfdPlotMonteCarloConvergence(MC, varargin)
 %           AxesLbar
 %           Lines
 %           Trace
+%           PlotData
 %           ExportPath
 %           Options
 %
 % EXAMPLE
-%   MC = cdfdCycleMonteCarlo(C, ...
-%       'BudgetMode', 'transitions', ...
-%       'NumTransitions', 200000, ...
-%       'BatchTransitions', 20000);
-%
 %   out = cdfdPlotMonteCarloConvergence(MC);
 %
 %   out = cdfdPlotMonteCarloConvergence(MC, ...
 %       'ExactT_C', R.summary.T_C, ...
-%       'ExactLbar_C', R.summary.Lbar_C);
+%       'ExactLbar_C', R.summary.Lbar_C, ...
+%       'PlotMode', 'relative_error');
 
     opts = parsePlotOptions(varargin{:});
 
@@ -80,6 +80,56 @@ function out = cdfdPlotMonteCarloConvergence(MC, varargin)
 
     BatchTC = full(Trace.Batch_T_C);
     BatchLbar = full(Trace.Batch_Lbar_C);
+
+    plotMode = lower(string(opts.PlotMode));
+
+    switch plotMode
+        case "estimate"
+            yTC = TC;
+            yBatchTC = BatchTC;
+            yRefTC = opts.ExactT_C;
+
+            yLbar = Lbar;
+            yBatchLbar = BatchLbar;
+            yRefLbar = opts.ExactLbar_C;
+
+            yLabelTC = 'Completed circular throughput, $T_C$';
+            yLabelLbar = 'Mean cycle length, $\bar{L}_C$';
+
+            %yLabelTC = 'Completed circular throughput, T_C';
+            %yLabelLbar = 'Mean cycle length, Lbar_C';
+
+            titleTC = 'Convergence of completed circular throughput';
+            titleLbar = 'Convergence of mean cycle length';
+
+            referenceLabel = 'Reference value';
+
+        case "relative_error"
+            validateReferenceValue(opts.ExactT_C, 'ExactT_C');
+            validateReferenceValue(opts.ExactLbar_C, 'ExactLbar_C');
+
+            yTC = 100 * (TC - opts.ExactT_C) ./ opts.ExactT_C;
+            yBatchTC = 100 * (BatchTC - opts.ExactT_C) ./ opts.ExactT_C;
+            yRefTC = 0;
+
+            yLbar = 100 * (Lbar - opts.ExactLbar_C) ./ opts.ExactLbar_C;
+            yBatchLbar = 100 * (BatchLbar - opts.ExactLbar_C) ./ opts.ExactLbar_C;
+            yRefLbar = 0;
+
+            yLabelTC = 'Relative error in $T_C$ (\%)';
+            yLabelLbar = 'Relative error in $\bar{L}_C$ (\%)';
+
+            %yLabelTC = 'Relative error in T_C (%)';
+            %yLabelLbar = 'Relative error in \bar{L}_C (%)';
+
+            titleTC = 'Relative error in completed circular throughput';
+            titleLbar = 'Relative error in mean cycle length';
+
+            referenceLabel = 'Zero error';
+
+        otherwise
+            error('PlotMode must be ''estimate'' or ''relative_error''.');
+    end
 
     if isempty(opts.Parent)
         visible = 'on';
@@ -128,7 +178,7 @@ function out = cdfdPlotMonteCarloConvergence(MC, varargin)
     hold(axT, 'on');
 
     if opts.ShowBatchEstimates
-        lines.BatchT_C = plot(axT, x, BatchTC, ...
+        lines.BatchT_C = plot(axT, x, yBatchTC, ...
             ':', ...
             'LineWidth', 1.0, ...
             'DisplayName', 'Batch estimate');
@@ -136,40 +186,44 @@ function out = cdfdPlotMonteCarloConvergence(MC, varargin)
         lines.BatchT_C = gobjects(0);
     end
 
-    lines.T_C = plot(axT, x, TC, ...
+    lines.T_C = plot(axT, x, yTC, ...
         '-o', ...
         'LineWidth', 1.6, ...
         'MarkerSize', 4, ...
         'DisplayName', 'Cumulative estimate');
 
-    if ~isempty(opts.ExactT_C)
-        lines.ExactT_C = yline(axT, opts.ExactT_C, ...
+    if ~isempty(yRefTC)
+        lines.ReferenceT_C = yline(axT, yRefTC, ...
             '--', ...
             'LineWidth', 1.2, ...
-            'DisplayName', 'Reference value');
+            'DisplayName', referenceLabel);
     else
-        lines.ExactT_C = gobjects(0);
+        lines.ReferenceT_C = gobjects(0);
     end
 
     hold(axT, 'off');
 
     grid(axT, 'on');
     xlabel(axT, 'Cumulative Markov transitions');
-    ylabel(axT, 'Completed throughput, T_C');
+    ylabel(axT, yLabelTC, 'Interpreter', 'latex');
 
-    title(axT, 'Convergence of completed circular throughput', ...
-        'Interpreter', 'none');
+    title(axT, titleTC, 'Interpreter', 'none');
 
     legend(axT, 'Location', 'best');
 
     cleanAxes(axT);
+
+    if plotMode == "relative_error"
+        setSymmetricYLimits(axT);
+        setSymmetricYLimits(axL);
+    end
 
     %% Bottom panel: Lbar_C
 
     hold(axL, 'on');
 
     if opts.ShowBatchEstimates
-        lines.BatchLbar_C = plot(axL, x, BatchLbar, ...
+        lines.BatchLbar_C = plot(axL, x, yBatchLbar, ...
             ':', ...
             'LineWidth', 1.0, ...
             'DisplayName', 'Batch estimate');
@@ -177,33 +231,37 @@ function out = cdfdPlotMonteCarloConvergence(MC, varargin)
         lines.BatchLbar_C = gobjects(0);
     end
 
-    lines.Lbar_C = plot(axL, x, Lbar, ...
+    lines.Lbar_C = plot(axL, x, yLbar, ...
         '-o', ...
         'LineWidth', 1.6, ...
         'MarkerSize', 4, ...
         'DisplayName', 'Cumulative estimate');
 
-    if ~isempty(opts.ExactLbar_C)
-        lines.ExactLbar_C = yline(axL, opts.ExactLbar_C, ...
+    if ~isempty(yRefLbar)
+        lines.ReferenceLbar_C = yline(axL, yRefLbar, ...
             '--', ...
             'LineWidth', 1.2, ...
-            'DisplayName', 'Reference value');
+            'DisplayName', referenceLabel);
     else
-        lines.ExactLbar_C = gobjects(0);
+        lines.ReferenceLbar_C = gobjects(0);
     end
 
     hold(axL, 'off');
 
     grid(axL, 'on');
     xlabel(axL, 'Cumulative Markov transitions');
-    ylabel(axL, 'Mean cycle length, Lbar_C');
+    ylabel(axL, yLabelLbar, 'Interpreter', 'latex');
 
-    title(axL, 'Convergence of mean cycle length', ...
-        'Interpreter', 'none');
+    title(axL, titleLbar, 'Interpreter', 'none');
 
     legend(axL, 'Location', 'best');
 
     cleanAxes(axL);
+
+     if plotMode == "relative_error"
+        setSymmetricYLimits(axT);
+        setSymmetricYLimits(axL);
+    end
 
     %% Overall title
 
@@ -236,6 +294,21 @@ function out = cdfdPlotMonteCarloConvergence(MC, varargin)
         fprintf('Exported %s\n', exportPath);
     end
 
+    PlotData = table( ...
+        x, ...
+        yTC, ...
+        yBatchTC, ...
+        yLbar, ...
+        yBatchLbar, ...
+        'VariableNames', { ...
+            'CumulativeTransitions', ...
+            'T_C', ...
+            'Batch_T_C', ...
+            'Lbar_C', ...
+            'Batch_Lbar_C' ...
+        } ...
+    );
+
     out = struct();
     out.Figure = fig;
     out.TiledLayout = tl;
@@ -243,6 +316,7 @@ function out = cdfdPlotMonteCarloConvergence(MC, varargin)
     out.AxesLbar = axL;
     out.Lines = lines;
     out.Trace = Trace;
+    out.PlotData = PlotData;
     out.ExportPath = exportPath;
     out.Options = opts;
 end
@@ -268,6 +342,22 @@ function validateMonteCarloInput(MC)
 end
 
 
+function validateReferenceValue(x, name)
+
+    if isempty(x)
+        error('PlotMode=''relative_error'' requires %s.', name);
+    end
+
+    if ~isnumeric(x) || ~isscalar(x) || ~isfinite(x)
+        error('%s must be a finite numeric scalar.', name);
+    end
+
+    if abs(x) <= eps
+        error('%s must be non-zero for relative-error plotting.', name);
+    end
+end
+
+
 function cleanAxes(ax)
 % cleanAxes
 % Remove interactive toolbar artefacts before export where supported.
@@ -287,6 +377,7 @@ end
 function opts = parsePlotOptions(varargin)
 
     opts = struct();
+    opts.PlotMode = 'estimate';
     opts.ExactT_C = [];
     opts.ExactLbar_C = [];
     opts.ShowBatchEstimates = true;
@@ -305,6 +396,9 @@ function opts = parsePlotOptions(varargin)
         value = varargin{k+1};
 
         switch lower(name)
+            case 'plotmode'
+                opts.PlotMode = value;
+
             case 'exactt_c'
                 opts.ExactT_C = value;
 
@@ -333,4 +427,18 @@ function opts = parsePlotOptions(varargin)
                 error('Unknown option: %s.', name);
         end
     end
+end
+
+function setSymmetricYLimits(ax)
+% setSymmetricYLimits
+% Use symmetric y-limits around zero for relative-error plots.
+
+    yl = ylim(ax);
+    m = max(abs(yl));
+
+    if m == 0 || ~isfinite(m)
+        m = 1;
+    end
+
+    ylim(ax, [-m, m]);
 end
