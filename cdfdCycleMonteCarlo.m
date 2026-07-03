@@ -127,6 +127,7 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
 
     compRows = {};
     traceTables = {};
+    componentStopReasons = strings(0, 1);
 
     totalSamples = 0;
     totalTransitions = 0;
@@ -140,6 +141,7 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
         Csub = C(nodes, nodes);
 
         componentResult = simulateComponent(Csub, nodes, a, V_C, opts);
+        componentStopReasons(end+1, 1) = string(componentResult.StopReason); %#ok<AGROW>
 
         totalSamples = totalSamples + componentResult.NumSamples;
         totalTransitions = totalTransitions + componentResult.NumTransitions;
@@ -176,6 +178,7 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
             componentResult.Lbar_C, ...
             componentResult.VolumeFromCycles, ...
             componentResult.VolumeRelError ...
+            componentResult.StopReason ...
         }; %#ok<AGROW>
 
         if opts.Verbose
@@ -237,6 +240,7 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
                 'Lbar_C', ...
                 'VolumeFromCycles', ...
                 'VolumeRelError' ...
+                'StopReason' ...
             });
     end
 
@@ -268,6 +272,18 @@ function MC = cdfdCycleMonteCarlo(C, varargin)
 
     [Trace, convergenceDiagnostics] = aggregateComponentTraces( ...
         ComponentTrace, V_C, numel(components), tol);
+    
+    if lower(string(opts.BudgetMode)) == "adaptive"
+        if all(componentStopReasons == "adaptive_stable")
+            convergenceDiagnostics.StopReason = "adaptive_stable";
+        else
+            convergenceDiagnostics.StopReason = "max_batches_or_component_limit";
+        end
+    else
+        convergenceDiagnostics.StopReason = "fixed_budget";
+    end
+
+    convergenceDiagnostics.ComponentStopReasons = componentStopReasons;
 
     Estimates = struct();
     Estimates.V_C = V_C;
@@ -330,7 +346,10 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
     numTransitions = 0;
     totalCycleLengthSum = 0;
 
-    traceEnabled = ~isempty(opts.BatchTransitions);
+    budgetMode = lower(string(opts.BudgetMode));
+
+    traceEnabled = ~isempty(opts.BatchTransitions) || budgetMode == "adaptive";
+
     batchNumber = 0;
     nextBatchTransition = opts.BatchTransitions;
 
@@ -340,25 +359,46 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
 
     traceRows = {};
 
-    budgetMode = lower(string(opts.BudgetMode));
+    traceTC = zeros(0, 1);
+    traceLbar = zeros(0, 1);
+
+    adaptiveStop = false;
+    stopReason = "fixed_budget";
+
+    if budgetMode == "adaptive"
+        stopReason = "max_batches";
+    end
 
     while true
         switch budgetMode
             case "cycles"
                 if numSamples >= opts.NumSamples
+                    stopReason = "fixed_cycles";
                     break;
                 end
 
             case "transitions"
                 if numTransitions >= opts.NumTransitions
+                    stopReason = "fixed_transitions";
+                    break;
+                end
+
+            case "adaptive"
+                if adaptiveStop
+                    break;
+                end
+
+                if batchNumber >= opts.MaxBatches
+                    stopReason = "max_batches";
                     break;
                 end
 
             otherwise
-                error('BudgetMode must be cycles or transitions.');
+                error('BudgetMode must be cycles, transitions, or adaptive.');
         end
 
         if numTransitions >= opts.MaxTransitions
+            stopReason = "max_transitions";
             error('Component %d reached MaxTransitions=%g before completing requested budget.', ...
                 componentIndex, opts.MaxTransitions);
         end
@@ -394,7 +434,7 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
         if traceEnabled && numTransitions >= nextBatchTransition
             batchNumber = batchNumber + 1;
 
-            traceRows(end+1, :) = makeComponentTraceRow( ...
+            row = makeComponentTraceRow( ...
                 componentIndex, ...
                 batchNumber, ...
                 S, ...
@@ -406,16 +446,32 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
                 batchStartSamples, ...
                 batchStartTransitions, ...
                 batchStartCycleLengthSum, ...
-                tol); %#ok<AGROW>
+                tol);
+
+            traceRows(end+1, :) = row; %#ok<AGROW>
+
+            traceTC(end+1, 1) = row{8}; %#ok<AGROW>
+            traceLbar(end+1, 1) = row{9}; %#ok<AGROW>
 
             batchStartTransitions = numTransitions;
             batchStartSamples = numSamples;
             batchStartCycleLengthSum = totalCycleLengthSum;
             nextBatchTransition = nextBatchTransition + opts.BatchTransitions;
+
+            if budgetMode == "adaptive"
+                if batchNumber >= opts.MaxBatches
+                    adaptiveStop = true;
+                    stopReason = "max_batches";
+
+                elseif isAdaptiveStable(traceTC, traceLbar, batchNumber, opts)
+                    adaptiveStop = true;
+                    stopReason = "adaptive_stable";
+                end
+            end
         end
     end
 
-    if traceEnabled
+    if traceEnabled && budgetMode ~= "adaptive"
         if batchNumber == 0 || batchStartTransitions < numTransitions
             batchNumber = batchNumber + 1;
 
@@ -492,6 +548,7 @@ function result = simulateComponent(Csub, globalNodes, componentIndex, V_C, opts
     result.Lbar_C = Lbar_hat;
     result.VolumeFromCycles = volumeFromCycles;
     result.VolumeRelError = volumeRelError;
+    result.StopReason = stopReason;
 end
 
 
@@ -940,7 +997,6 @@ function validateSquareNonnegative(C, tol)
     end
 end
 
-
 function opts = parseMonteCarloOptions(varargin)
 
     opts = struct();
@@ -955,6 +1011,13 @@ function opts = parseMonteCarloOptions(varargin)
     opts.CheckBalance = true;
     opts.Verbose = true;
     opts.MaxTransitions = Inf;
+
+    % Adaptive stopping options.
+    opts.MinBatches = 10;
+    opts.MaxBatches = 200;
+    opts.StabilityBatches = 3;
+    opts.RelTolT_C = 0.01;
+    opts.RelTolLbar_C = 0.01;
 
     if mod(numel(varargin), 2) ~= 0
         error('Options must be name-value pairs.');
@@ -998,6 +1061,21 @@ function opts = parseMonteCarloOptions(varargin)
             case 'maxtransitions'
                 opts.MaxTransitions = value;
 
+            case 'minbatches'
+                opts.MinBatches = value;
+
+            case 'maxbatches'
+                opts.MaxBatches = value;
+
+            case 'stabilitybatches'
+                opts.StabilityBatches = value;
+
+            case {'reltolt_c', 'reltolt'}
+                opts.RelTolT_C = value;
+
+            case {'reltollbar_c', 'reltollbar'}
+                opts.RelTolLbar_C = value;
+
             otherwise
                 error('Unknown option: %s.', name);
         end
@@ -1006,11 +1084,34 @@ function opts = parseMonteCarloOptions(varargin)
     validatePositiveIntegerLike(opts.NumSamples, 'NumSamples');
     validatePositiveIntegerLike(opts.NumTransitions, 'NumTransitions');
 
-    if ~isempty(opts.BatchTransitions)
+    budgetMode = lower(string(opts.BudgetMode));
+
+    if budgetMode == "adaptive"
+        if isempty(opts.BatchTransitions)
+            opts.BatchTransitions = 50000;
+        end
+
+        validatePositiveIntegerLike(opts.BatchTransitions, 'BatchTransitions');
+        validatePositiveIntegerLike(opts.MinBatches, 'MinBatches');
+        validatePositiveIntegerLike(opts.MaxBatches, 'MaxBatches');
+        validatePositiveIntegerLike(opts.StabilityBatches, 'StabilityBatches');
+
+        if opts.MaxBatches < opts.MinBatches
+            error('MaxBatches must be at least MinBatches.');
+        end
+
+        if opts.MinBatches < opts.StabilityBatches + 1
+            error('MinBatches must be at least StabilityBatches + 1.');
+        end
+
+        validatePositiveScalar(opts.RelTolT_C, 'RelTolT_C');
+        validatePositiveScalar(opts.RelTolLbar_C, 'RelTolLbar_C');
+
+    elseif ~isempty(opts.BatchTransitions)
         validatePositiveIntegerLike(opts.BatchTransitions, 'BatchTransitions');
 
-        if lower(string(opts.BudgetMode)) ~= "transitions"
-            error('BatchTransitions currently requires BudgetMode=''transitions''.');
+        if budgetMode ~= "transitions"
+            error('BatchTransitions requires BudgetMode=''transitions'' or BudgetMode=''adaptive''.');
         end
     end
 
@@ -1025,4 +1126,43 @@ function validatePositiveIntegerLike(x, name)
     if ~isnumeric(x) || ~isscalar(x) || ~isfinite(x) || x < 1 || x ~= round(x)
         error('%s must be a positive integer scalar.', name);
     end
+end
+
+function validatePositiveScalar(x, name)
+
+    if ~isnumeric(x) || ~isscalar(x) || ~isfinite(x) || x <= 0
+        error('%s must be a positive finite scalar.', name);
+    end
+end
+
+function stable = isAdaptiveStable(traceTC, traceLbar, batchNumber, opts)
+% isAdaptiveStable
+% Decide whether adaptive Monte Carlo has stabilised over recent batches.
+
+    stable = false;
+
+    if batchNumber < opts.MinBatches
+        return;
+    end
+
+    neededPoints = opts.StabilityBatches + 1;
+
+    if numel(traceTC) < neededPoints || numel(traceLbar) < neededPoints
+        return;
+    end
+
+    idx = (numel(traceTC) - neededPoints + 1):numel(traceTC);
+
+    recentTC = traceTC(idx);
+    recentLbar = traceLbar(idx);
+
+    if any(~isfinite(recentTC)) || any(~isfinite(recentLbar))
+        return;
+    end
+
+    relChangeTC = abs(diff(recentTC)) ./ max(1, abs(recentTC(2:end)));
+    relChangeLbar = abs(diff(recentLbar)) ./ max(1, abs(recentLbar(2:end)));
+
+    stable = all(relChangeTC <= opts.RelTolT_C) && ...
+             all(relChangeLbar <= opts.RelTolLbar_C);
 end
